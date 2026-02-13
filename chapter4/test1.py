@@ -1,6 +1,7 @@
 import re
+import difflib
 from llm_client import HelloAgentsLLM
-from tools import ToolExecutor, search
+from tools import ToolExecutor, search, calculator
 
 # (此处省略 REACT_PROMPT_TEMPLATE 的定义)
 REACT_PROMPT_TEMPLATE = """
@@ -24,15 +25,23 @@ History: {history}
 """
 
 class ReActAgent:
-    def __init__(self, llm_client: HelloAgentsLLM, tool_executor: ToolExecutor, max_steps: int = 5):
+    def __init__(
+        self,
+        llm_client: HelloAgentsLLM,
+        tool_executor: ToolExecutor,
+        max_steps: int = 8,
+        max_consecutive_failures: int = 3,
+    ):
         self.llm_client = llm_client
         self.tool_executor = tool_executor
         self.max_steps = max_steps
+        self.max_consecutive_failures = max_consecutive_failures
         self.history = []
 
     def run(self, question: str):
         self.history = []
         current_step = 0
+        consecutive_failures = 0
 
         while current_step < self.max_steps:
             current_step += 1
@@ -49,7 +58,20 @@ class ReActAgent:
 
             thought, action = self._parse_output(response_text)
             if thought: print(f"🤔 思考: {thought}")
-            if not action: print("警告：未能解析出有效的Action，流程终止。"); break
+            if not action:
+                consecutive_failures += 1
+                observation = self._build_correction_observation(
+                    error="未能解析出 Action。请严格输出 `Action: 工具名[参数]` 或 `Action: Finish[答案]`。",
+                    consecutive_failures=consecutive_failures
+                )
+                print(f"⚠️ 观察: {observation}")
+                self.history.append("Action: [解析失败]")
+                self.history.append(f"Observation: {observation}")
+                if consecutive_failures >= self.max_consecutive_failures:
+                    final_answer = "工具选择失败次数过多，已终止。请改用正确工具名和参数后重试。"
+                    print(f"❌ 最终状态: {final_answer}")
+                    return final_answer
+                continue
             
             if action.startswith("Finish"):
                 # 如果是Finish指令，提取最终答案并结束
@@ -58,16 +80,52 @@ class ReActAgent:
                 return final_answer
             
             tool_name, tool_input = self._parse_action(action)
-            if not tool_name or not tool_input:
-                self.history.append("Observation: 无效的Action格式，请检查。"); continue
+            if not tool_name:
+                consecutive_failures += 1
+                observation = self._build_correction_observation(
+                    error=f"无效的 Action 格式：{action}",
+                    consecutive_failures=consecutive_failures
+                )
+                self.history.append(f"Action: {action}")
+                self.history.append(f"Observation: {observation}")
+                print(f"⚠️ 观察: {observation}")
+                if consecutive_failures >= self.max_consecutive_failures:
+                    final_answer = "工具选择失败次数过多，已终止。请改用正确工具名和参数后重试。"
+                    print(f"❌ 最终状态: {final_answer}")
+                    return final_answer
+                continue
 
             print(f"🎬 行动: {tool_name}[{tool_input}]")
             tool_function = self.tool_executor.getTool(tool_name)
-            observation = tool_function(tool_input) if tool_function else f"错误：未找到名为 '{tool_name}' 的工具。"
+            if not tool_function:
+                available_names = self.tool_executor.listToolNames()
+                suggestion = difflib.get_close_matches(tool_name, available_names, n=1)
+                hint = f"你是不是想用 `{suggestion[0]}`？" if suggestion else "请从可用工具中精确选择工具名。"
+                observation = self._build_correction_observation(
+                    error=f"未找到名为 '{tool_name}' 的工具。{hint}",
+                    consecutive_failures=consecutive_failures + 1
+                )
+                consecutive_failures += 1
+            else:
+                raw_observation = tool_function(tool_input)
+                if isinstance(raw_observation, str) and raw_observation.startswith("错误："):
+                    consecutive_failures += 1
+                    observation = self._build_correction_observation(
+                        error=raw_observation,
+                        consecutive_failures=consecutive_failures
+                    )
+                else:
+                    observation = raw_observation
+                    consecutive_failures = 0
             
             print(f"👀 观察: {observation}")
             self.history.append(f"Action: {action}")
             self.history.append(f"Observation: {observation}")
+
+            if consecutive_failures >= self.max_consecutive_failures:
+                final_answer = "工具选择失败次数过多，已终止。请改用正确工具名和参数后重试。"
+                print(f"❌ 最终状态: {final_answer}")
+                return final_answer
 
         print("已达到最大步数，流程终止。")
         return None
@@ -89,11 +147,24 @@ class ReActAgent:
         match = re.match(r"\w+\[(.*)\]", action_text, re.DOTALL)
         return match.group(1) if match else ""
 
+    def _build_correction_observation(self, error: str, consecutive_failures: int) -> str:
+        available_tools = ", ".join(self.tool_executor.listToolNames())
+        guidance = (
+            f"{error}\n"
+            f"纠错指引（已连续失败 {consecutive_failures} 次）:\n"
+            f"1) 仅使用这些工具名：{available_tools}\n"
+            "2) Action 格式必须是：工具名[参数]，不要输出额外标记\n"
+            "3) 需要计算时优先使用 Calculator，例如 Calculator[(123 + 456) * 789 / 12]"
+        )
+        return guidance
+
 if __name__ == '__main__':
     llm = HelloAgentsLLM()
     tool_executor = ToolExecutor()
     search_desc = "一个网页搜索引擎。当你需要回答关于时事、事实以及在你的知识库中找不到的信息时，应使用此工具。"
+    calculator_desc = "一个数学计算器。用于执行算术表达式计算（支持 + - * / // % ** 和括号）。"
     tool_executor.registerTool("Search", search_desc, search)
+    tool_executor.registerTool("Calculator", calculator_desc, calculator)
     agent = ReActAgent(llm_client=llm, tool_executor=tool_executor)
-    question = "最新款的苹果手机是哪一款"
+    question = "计算 (123 + 456) × 789 / 12 = ? 的结果"
     agent.run(question)
